@@ -1,7 +1,6 @@
 #include <cmath>
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/LaserScan.h>
-#include <nav_msgs/OccupancyGrid.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <tf2/LinearMath/Transform.h>
@@ -9,17 +8,11 @@
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include "DB-scan.cpp"
-#include "process_invisibility.cpp" 
-#include "dilation_grid.cpp"
 #include <pcl/filters/voxel_grid.h>
 //Include for compute normals
 #include <pcl/io/pcd_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/features/normal_3d_omp.h>
-#include <boost/thread/thread.hpp>
-// Include for testing
-#include <pcl/visualization/pcl_visualizer.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <math.h>
@@ -31,8 +24,10 @@ double slope_1,slp_first_RADIUS, height_1;
 double slope_2, slp_second_RADIUS, height_2;
 double slope_3,slp_third_RADIUS, height_3;
 
-double max_dis = 0;
-std::vector<double> distances;
+//法向量那一路的前置处理参数，要调就提成 launch 参数
+const double VOXEL_LEAF_SIZE = 0.05; //体素下采样边长 (m)
+const int    SOR_MEAN_K      = 20;   //统计滤波近邻数
+const double SOR_STDDEV_MUL  = 1.0;  //统计滤波标准差倍数
 
 bool get_msg_left = 0;
 bool get_msg_right = 0;
@@ -41,14 +36,10 @@ std::string laser_frame;
 std::string scan_topic_left;
 std::string scan_topic_right;
 std::string new_scan_topic;
-std::string new_scan_topic_2d;
 std::string filted_topic_3d;
-std::string dilated_topic_2d;
 
-ros::Publisher pub;//initialize the publisher
 livox_ros_driver2::CustomMsg scan_copy_left;//receiving the message from the livox
 livox_ros_driver2::CustomMsg scan_copy_right;
-// geometry_msgs::TransformStamped transformStamped;//initialize the transformStamped
 
 //callback function for the livox
 void scanCallback_left(const livox_ros_driver2::CustomMsg &scan)
@@ -61,64 +52,93 @@ void scanCallback_right(const livox_ros_driver2::CustomMsg &scan)
     scan_copy_right = scan;
     get_msg_right = 1;
 }
-//function to filter the points
+
+//坡度滤波：按离车体中心的距离分成四段，每段给一条高度上限直线，超过上限的点判为坡面/地面
 bool ispoint (double nx, double ny, double z, double nI)
 {
-    nx += 0.011;
-    ny -= -0.19495+0.02329;
-    if (nx*nx+ny*ny <= first_RADIUS*first_RADIUS){
-        return 0;
+    (void)nI; //暂时不用反射强度
+    // nx += 0.011;  偏心量？ 暂时弃用
+    // ny -= -0.19495+0.02329;
+
+    double r2 = nx*nx + ny*ny;
+    if (r2 <= first_RADIUS*first_RADIUS){
+        return false; //车体自身附近直接丢
     }
-    if (nx*nx+ny*ny <= second_RADIUS*first_RADIUS){
-        if (0.3<=z && z<=0.35){//what's the reference of the param?
-            distances.push_back(nx*nx+ny*ny);
-            max_dis = std::max(max_dis, nx*nx+ny*ny);
-        }
+    if (r2 <= second_RADIUS*second_RADIUS){
         return z<= start_height;
     }
-    if(nx*nx+ny*ny <=slp_first_RADIUS * slp_first_RADIUS){
-        double dis=sqrt(nx*nx+ny*ny)-second_RADIUS;
+    if(r2 <=slp_first_RADIUS * slp_first_RADIUS){
+        double dis=sqrt(r2)-second_RADIUS;
         return z<=std::min(max_height,dis*slope_1+start_height);//max_height for security
     }
-    
-    if(nx*nx+ny*ny <=slp_second_RADIUS * slp_second_RADIUS){
-        double dis=sqrt(nx*nx+ny*ny)-slp_first_RADIUS;
+
+    if(r2 <=slp_second_RADIUS * slp_second_RADIUS){
+        double dis=sqrt(r2)-slp_first_RADIUS;
         return z<=std::min(height_1,dis*slope_2+max_height);
     }
 
-    double dis=sqrt(nx*nx+ny*ny)-slp_second_RADIUS;
+    double dis=sqrt(r2)-slp_second_RADIUS;
     return z<=std::min(height_2,dis*slope_3+height_1);
-     return 1;
     //add judgement for the indensity
 }
 
-void down_sampling(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered)
+//把一帧 CustomMsg 做安装角补偿后拆成两路：origin 收全部有效点，filtered 只收通过坡度滤波的点
+void accumulate_scan(const livox_ros_driver2::CustomMsg &scan,
+                     pcl::PointCloud<pcl::PointXYZI> &origin,
+                     pcl::PointCloud<pcl::PointXYZI> &filtered)
 {
-    pcl::VoxelGrid<pcl::PointXYZ> sor;
-    sor.setInputCloud(cloud);
-    sor.setLeafSize(0.05f,0.05f,0.05f);
-    sor.filter(*cloud_filtered);
+    for (const auto &pt : scan.points)
+    {
+        double x = pt.x - 0.011;
+        double y = pt.y + 0.02329;
+        double z = pt.z - 0.04412;
+        double intensity = pt.reflectivity;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
+        {
+            continue;
+        }
+        pcl::PointXYZI point;
+        point.x = x;
+        point.y = y;
+        point.z = z;
+        point.intensity = intensity;
+        origin.points.push_back(point);
+
+        //注意这里传的是 -z，和存进点云的 z 不是一个值
+        if (ispoint(x, y, -z, intensity))
+        {
+            filtered.points.push_back(point);
+        }
+    }
 }
 
-void statistical_removal(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered)
+//体素下采样
+void down_sampling(const pcl::PointCloud<pcl::PointXYZI>::Ptr &input,
+                   pcl::PointCloud<pcl::PointXYZI>::Ptr &output)
 {
-    pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
-    sor.setInputCloud(cloud);
-    sor.setMeanK(50);
-    sor.setStddevMulThresh(1.0);
-    sor.filter(*cloud_filtered);
+    pcl::VoxelGrid<pcl::PointXYZI> voxel;
+    voxel.setInputCloud(input);
+    voxel.setLeafSize(VOXEL_LEAF_SIZE, VOXEL_LEAF_SIZE, VOXEL_LEAF_SIZE);
+    voxel.filter(*output);
 }
+
+//统计离群点移除
+void statistical_removal(const pcl::PointCloud<pcl::PointXYZI>::Ptr &input,
+                         pcl::PointCloud<pcl::PointXYZI>::Ptr &output)
+{
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
+    sor.setInputCloud(input);
+    sor.setMeanK(SOR_MEAN_K);
+    sor.setStddevMulThresh(SOR_STDDEV_MUL);
+    sor.filter(*output);
+}
+
 
 int main (int argc, char **argv)
 {
     std::string node_name = "threeD_lidar_filter_pointcloud";
     ros::init(argc, argv, node_name);
     ros::NodeHandle nh;
-    double dilation_radius;
-    if (!nh.getParam("/" + node_name + "/dilation_radius", dilation_radius)) {
-        ROS_ERROR("Failed to retrieve parameter 'dilation_radius'");
-        return -1;
-    }
     if (!nh.getParam("/" + node_name + "/base_frame", base_frame))
     {
         ROS_ERROR("Failed to retrieve parameter 'base_frame'");
@@ -194,28 +214,16 @@ int main (int argc, char **argv)
         ROS_ERROR("Failed to retrieve parameter 'slp_third_RADIUS'");
         return -1;
     }
-    if (!nh.getParam("/" + node_name + "/new_scan_topic_2d", new_scan_topic_2d))
-    {
-        ROS_ERROR("Failed to retrieve parameter 'new_scan_topic_2d'");
-        return -1;
-    }
     if (!nh.getParam("/" + node_name + "/filted_topic_3d", filted_topic_3d))
     {
         ROS_ERROR("Failed to retrieve parameter 'filted_topic_3d'");
-        return -1;
-    }
-    if (!nh.getParam("/" + node_name + "/dilated_topic_2d", dilated_topic_2d))
-    {
-        ROS_ERROR("Failed to retrieve parameter 'dilated_topic_2d'");
         return -1;
     }
 
     ros::Subscriber sub_left = nh.subscribe(scan_topic_left, 1, scanCallback_left);
     ros::Subscriber sub_right = nh.subscribe(scan_topic_right, 1, scanCallback_right);
     ros::Publisher pub2 = nh.advertise<sensor_msgs::PointCloud2>(new_scan_topic, 1);//original pointcloud
-    ros::Publisher pub3 = nh.advertise<nav_msgs::OccupancyGrid>(new_scan_topic_2d, 1);
-    ros::Publisher pub4 = nh.advertise<sensor_msgs::PointCloud2>(filted_topic_3d, 1);//filtered
-    ros::Publisher pub5 = nh.advertise<nav_msgs::OccupancyGrid>(dilated_topic_2d, 1);
+    ros::Publisher pub4 = nh.advertise<sensor_msgs::PointCloud2>(filted_topic_3d, 1);//filtered pointcloud
     ros::Rate rate(50.0);
 
     while (ros::ok())
@@ -225,191 +233,63 @@ int main (int argc, char **argv)
             // ROS_INFO("waiting for the message");
             continue;
         }
-        
-        pcl::PointCloud<pcl::PointXYZI> pcl_cloud; 
-        pcl::PointCloud<pcl::PointXYZI> origin_pcl_cloud; 
+
         auto scan_record_left = scan_copy_left;
         auto scan_record_right = scan_copy_right;
 
-        for (int i = 0; i < scan_record_left.points.size(); i++)
-        {
-            double x = scan_record_left.points[i].x - 0.011;
-            // double y = -scan_record_left.points[i].y - 0.02329;
-            // double z = -scan_record_left.points[i].z + 0.04412;
-            //翻转yz
-            double y = scan_record_left.points[i].y + 0.02329;
-            double z = scan_record_left.points[i].z - 0.04412;
-            double intensity = scan_record_left.points[i].reflectivity;
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
-            {
-                continue;
-            }
-            pcl::PointXYZI point;
-            point.x = x;
-            point.y = y;
-            point.z = z;
-            point.intensity = intensity; 
-            origin_pcl_cloud.points.push_back(point);
-        }
-        for (int i = 0; i < scan_record_right.points.size(); i++)
-        {
-            double x = scan_record_right.points[i].x - 0.011;
-            //对老：翻转yz
-            double y = scan_record_right.points[i].y + 0.02329;
-            double z = scan_record_right.points[i].z - 0.04412;
-            // double y = scan_record_right.points[i].y + 0.02329;
-            // double z = scan_record_right.points[i].z - 0.04412;
-            double intensity = scan_record_right.points[i].reflectivity;
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
-            {
-                continue;
-            }
-            pcl::PointXYZI point;
-            point.x = x;
-            point.y = y;
-            point.z = z;
-            point.intensity = intensity; 
-            origin_pcl_cloud.points.push_back(point);
-        }
-        // print total size of points
-        // ROS_INFO("Total points: %zu", scan_record_left.points.size() + scan_record_right.points.size());
-        for (int i = 0; i < scan_record_left.points.size(); i++)
-        {
-            double x = scan_record_left.points[i].x - 0.011;
-            // double y = -scan_record_left.points[i].y - 0.02329;
-            // double z = -scan_record_left.points[i].z + 0.04412;
-            //翻转yz
-            double y = scan_record_left.points[i].y + 0.02329;
-            double z = scan_record_left.points[i].z - 0.04412;
-            double intensity = scan_record_left.points[i].reflectivity;
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
-            {
-                continue;
-            }
-            if (ispoint(x,y,-z,intensity))
-            {
-                pcl::PointXYZI point;
-                point.x = x;
-                point.y = y;
-                point.z = z;
-                point.intensity = intensity; 
-                pcl_cloud.points.push_back(point);
-            }
-        }
-        for (int i = 0; i < scan_record_right.points.size(); i++)
-        {
-            double x = scan_record_right.points[i].x - 0.011;
-            // double y = -scan_record_right.points[i].y - 0.02329;
-            // double z = -scan_record_right.points[i].z + 0.04412;
-            //翻转yz
-            double y = scan_record_right.points[i].y + 0.02329;
-            double z = scan_record_right.points[i].z - 0.04412;
-            double intensity = scan_record_right.points[i].reflectivity;
-            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
-            {
-                continue;
-            }
-            if (ispoint(x,y,-z,intensity))
-            {
-                pcl::PointXYZI point;
-                point.x = x;
-                point.y = y;
-                point.z = z;
-                point.intensity = intensity; 
-                pcl_cloud.points.push_back(point);
-            }
-        }
-        // print the size of the filtered points
-        // ROS_INFO("Filtered points: %zu", pcl_cloud.points.size());
+        pcl::PointCloud<pcl::PointXYZI> origin_pcl_cloud;//只做安装角补偿，给调试看
+        pcl::PointCloud<pcl::PointXYZI> pcl_cloud;//过了坡度滤波的点
+        origin_pcl_cloud.points.reserve(scan_record_left.points.size() + scan_record_right.points.size());
+        pcl_cloud.points.reserve(scan_record_left.points.size() + scan_record_right.points.size());
 
-        // sensor_msgs::PointCloud2 output1;
-        // pcl::toROSMsg(pcl_cloud, output1);
-        // output1.header.frame_id = laser_frame; // replace with your frame id
-        // output1.header.stamp = ros::Time::now();
-        // pub2.publish(output1);
+        accumulate_scan(scan_record_left, origin_pcl_cloud, pcl_cloud);
+        accumulate_scan(scan_record_right, origin_pcl_cloud, pcl_cloud);
+
+        // print the sizes of the two clouds
+        // ROS_INFO("Origin points: %zu, after slope filter: %zu", origin_pcl_cloud.points.size(), pcl_cloud.points.size());
 
         ros::Time start_time = ros::Time::now();//TimeTest Start
 
-        //Down Sampling
-        pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud_xyz(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::copyPointCloud(pcl_cloud, *pcl_cloud_xyz);
-        
-        // DBSCAN dbscan(0.2, 5); // radius, minPts
-        // dbscan.run(pcl_cloud_xyz);
-        
-        pcl::PointCloud<pcl::PointXYZ>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud_xyz_no_intensity(new pcl::PointCloud<pcl::PointXYZ>);
-        //pcl::copyPointCloud(*pcl_cloud_xyz, *temp_cloud);
-        //pcl::copyPointCloud(*pcl_cloud_xyz, *pcl_cloud_xyz_no_intensity);
-        down_sampling(pcl_cloud_xyz, temp_cloud);
-        statistical_removal(temp_cloud, pcl_cloud_xyz_no_intensity);
-        // ROS_INFO("Filtered points2: %zu", pcl_cloud_xyz_no_intensity->points.size());
+        //Down Sampling + Statistical Removal
+        pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud_ptr(new pcl::PointCloud<pcl::PointXYZI>(pcl_cloud));
+        pcl::PointCloud<pcl::PointXYZI>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+        pcl::PointCloud<pcl::PointXYZI>::Ptr denoised_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+        down_sampling(pcl_cloud_ptr, temp_cloud);
+        statistical_removal(temp_cloud, denoised_cloud);
+        // ROS_INFO("After down sampling + SOR: %zu", denoised_cloud->points.size());
 
-        // ros::Duration filter_duration = end_time - start_time;
-        // ROS_INFO("clustering took %f seconds", filter_duration.toSec());
-        // ROS_INFO("Filtered points: %zu", pcl_cloud_xyz_no_intensity->points.size());
-        ros::Time end_time = ros::Time::now();
         //Find Normals
-        pcl::NormalEstimationOMP<pcl::PointXYZ, pcl::Normal> n;
+        pcl::NormalEstimationOMP<pcl::PointXYZI, pcl::Normal> n;
         pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
-        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-        n.setInputCloud(pcl_cloud_xyz_no_intensity);
+        pcl::search::KdTree<pcl::PointXYZI>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZI>);
+        n.setInputCloud(denoised_cloud);
         n.setSearchMethod(tree);
         n.setKSearch(20);
         n.setNumberOfThreads(8);
         n.compute(*normals);
 
-        //Visualization Test
-        // boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
-        // viewer->setBackgroundColor(0.3, 0.3, 0.3);
-        // viewer->addText("faxian",10,10,"text");
-        // pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> single_color(pcl_cloud_xyz_no_intensity, 0, 255, 0);
-        // viewer->addCoordinateSystem(0.1);
-        // viewer->addPointCloud<pcl::PointXYZ>(pcl_cloud_xyz_no_intensity, single_color, "cloud");
-        
-        // viewer->addPointCloudNormals<pcl::PointXYZ, pcl::Normal>(pcl_cloud_xyz_no_intensity, normals, 1, 0.05, "normals");
-        // viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "cloud");
-        // while (!viewer->wasStopped())
-        // {
-        //     viewer->spinOnce(100);
-        //     boost::this_thread::sleep(boost::posix_time::microseconds(100000));
-        // }
-
-        //Filter the points with the normals vertical to XOY
-
-        pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        for (size_t i = 0; i < pcl_cloud_xyz_no_intensity->points.size(); ++i) {
+        //Filter the points whose normal is (nearly) horizontal, i.e. the angle to the z axis is near 90 deg
+        pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_xyzi(new pcl::PointCloud<pcl::PointXYZI>);
+        filtered_cloud_xyzi->points.reserve(denoised_cloud->points.size());
+        for (size_t i = 0; i < denoised_cloud->points.size(); ++i) {
             const auto& normal = normals->points[i];
             // 计算法向量与 z 轴的夹角
-            float angle = std::acos(normal.normal_z / std::sqrt(normal.normal_x * normal.normal_x + normal.normal_y * normal.normal_y + normal.normal_z * normal.normal_z));
-            // 如果夹角不接近 90 度，则保留该点
-            if (std::abs(angle - M_PI / 2) < M_PI/4) { // 0.1 弧度的容差
-                filtered_cloud->points.push_back(pcl_cloud_xyz_no_intensity->points[i]);
-                // ROS_INFO("angle: %f", angle);
-            }else{
-                // ROS_INFO("angle: %f, x: %f, y: %f, z: %f", angle, pcl_cloud_xyz_no_intensity->points[i].x, pcl_cloud_xyz_no_intensity->points[i].y, pcl_cloud_xyz_no_intensity->points[i].z);
+            float norm = std::sqrt(normal.normal_x * normal.normal_x + normal.normal_y * normal.normal_y + normal.normal_z * normal.normal_z);
+            if (norm <= 0.0f) {
+                continue;//法向量没算出来的点直接丢
+            }
+            float angle = std::acos(normal.normal_z / norm);
+            
+            if (d <= M_PI/11.5 || d >= M_PI/10) { //滤除17度左右的坡面
+                filtered_cloud_xyzi->points.push_back(denoised_cloud->points[i]);
             }
         }
+        // ROS_INFO("After normal filter: %zu", filtered_cloud_xyzi->points.size());
 
-        // 将 filtered_cloud 转换为 pcl::PointCloud<pcl::PointXYZI>
-        pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_xyzi(new pcl::PointCloud<pcl::PointXYZI>);
-        pcl::copyPointCloud(*filtered_cloud, *filtered_cloud_xyzi);
-        end_time = ros::Time::now();
-        // ROS_INFO("Filtered points: %zu", filtered_cloud_xyzi->points.size());
+        ros::Time end_time = ros::Time::now();//TimeTest End
 
-        // DBSCAN dbscan(0.2, 5); // radius, minPts
-        // dbscan.run(filtered_cloud_xyzi);
-        
-        // ROS_INFO("Clustered points: %zu", filtered_cloud_xyzi->points.size());
-
-        // TimeTest End
-        
         ros::Duration filter_duration = end_time - start_time;
         // ROS_INFO("Filtering took %f seconds", filter_duration.toSec());
-        
-        // Debug: Print cloud sizes
-        // ROS_INFO("Original cloud points: %zu", pcl_cloud.points.size());
-        // ROS_INFO("Filtered cloud points: %zu", pcl_cloud_xyz->points.size());
 
         // Publish original cloud
         sensor_msgs::PointCloud2 output;
@@ -424,61 +304,6 @@ int main (int argc, char **argv)
         output_filtered.header.frame_id = laser_frame;
         output_filtered.header.stamp = ros::Time::now();
         pub4.publish(output_filtered);
-
-        
-        pcl::PointCloud<pcl::PointXYZI> pcl_cloud_2d;
-        for (const auto& point : *filtered_cloud_xyzi) {
-            pcl::PointXYZI point_2d;
-            point_2d.x = point.x;
-            point_2d.y = point.y;
-            point_2d.z = 0.0; // 将z坐标设置为0，转换为二维点云
-            point_2d.intensity = point.intensity;
-            pcl_cloud_2d.points.push_back(point_2d);
-        }
-        
-        nav_msgs::OccupancyGrid occupancy_grid;
-        occupancy_grid.header.frame_id = laser_frame;
-        occupancy_grid.header.stamp = ros::Time::now();
-        occupancy_grid.info.resolution = 0.05; // 栅格分辨率
-        occupancy_grid.info.width = 200; // 栅格地图宽度（单位：栅格数）
-        occupancy_grid.info.height = 200; // 栅格地图高度（单位：栅格数）
-        occupancy_grid.info.origin.position.x = -5.0; // 地图原点的x坐标
-        occupancy_grid.info.origin.position.y = -5.0; // 地图原点的y坐标
-        occupancy_grid.info.origin.position.z = 0.0;
-        occupancy_grid.info.origin.orientation.w = 1.0;
-
-        occupancy_grid.data.resize(occupancy_grid.info.width * occupancy_grid.info.height, 0);
-
-        double center_x = occupancy_grid.info.origin.position.x + occupancy_grid.info.width * occupancy_grid.info.resolution / 2.0;
-        double center_y = occupancy_grid.info.origin.position.y + occupancy_grid.info.height * occupancy_grid.info.resolution / 2.0;
-        
-        for (const auto& point : pcl_cloud_2d.points) {
-            int x_index = static_cast<int>((point.x - occupancy_grid.info.origin.position.x) / occupancy_grid.info.resolution);
-            int y_index = static_cast<int>((point.y - occupancy_grid.info.origin.position.y) / occupancy_grid.info.resolution);
-
-            if (x_index >= 0 && x_index < occupancy_grid.info.width && y_index >= 0 && y_index < occupancy_grid.info.height) {
-                int index = y_index * occupancy_grid.info.width + x_index;
-                occupancy_grid.data[index] = 100; // 设置占据栅格的值（0-100）
-            }
-        }
-        
-        //pub3.publish(occupancy_grid);
-
-        start_time = ros::Time::now();
-        dilateOccupancyGrid(occupancy_grid, dilation_radius);
-        end_time = ros::Time::now();
-
-        ros::Duration dilation_duration = end_time - start_time;
-        // ROS_INFO("Dilation took %f seconds", dilation_duration.toSec());
-
-        start_time = ros::Time::now();
-        processVisibility(occupancy_grid);
-        end_time = ros::Time::now();
-
-        ros::Duration invisibility_duration = end_time - start_time;
-        // ROS_INFO("Invisibility took %f seconds", invisibility_duration.toSec());
-
-        pub5.publish(occupancy_grid);
 
         get_msg_left = 0;
         get_msg_right = 0;
