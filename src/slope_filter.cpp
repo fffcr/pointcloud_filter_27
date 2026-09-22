@@ -18,11 +18,11 @@
 #include <math.h>
 
 //parameters given by the launch file
-double first_RADIUS, second_RADIUS, max_height,start_height;
+// double first_RADIUS, second_RADIUS, max_height,start_height;
 
-double slope_1,slp_first_RADIUS, height_1;
-double slope_2, slp_second_RADIUS, height_2;
-double slope_3,slp_third_RADIUS, height_3;
+// double slope_1,slp_first_RADIUS, height_1;
+// double slope_2, slp_second_RADIUS, height_2;
+// double slope_3,slp_third_RADIUS, height_3;
 
 //法向量那一路的前置处理参数，要调就提成 launch 参数
 const double VOXEL_LEAF_SIZE = 0.05; //体素下采样边长 (m)
@@ -64,22 +64,23 @@ bool ispoint (double nx, double ny, double z, double nI)
     if (r2 <= first_RADIUS*first_RADIUS){
         return false; //车体自身附近直接丢
     }
-    if (r2 <= second_RADIUS*second_RADIUS){
-        return z<= start_height;
-    }
-    if(r2 <=slp_first_RADIUS * slp_first_RADIUS){
-        double dis=sqrt(r2)-second_RADIUS;
-        return z<=std::min(max_height,dis*slope_1+start_height);//max_height for security
-    }
+    // if (r2 <= second_RADIUS*second_RADIUS){
+    //     return z<= start_height;
+    // }
+    // if(r2 <=slp_first_RADIUS * slp_first_RADIUS){
+    //     double dis=sqrt(r2)-second_RADIUS;
+    //     return z<=std::min(max_height,dis*slope_1+start_height);//max_height for security
+    // }
 
-    if(r2 <=slp_second_RADIUS * slp_second_RADIUS){
-        double dis=sqrt(r2)-slp_first_RADIUS;
-        return z<=std::min(height_1,dis*slope_2+max_height);
-    }
+    // if(r2 <=slp_second_RADIUS * slp_second_RADIUS){
+    //     double dis=sqrt(r2)-slp_first_RADIUS;
+    //     return z<=std::min(height_1,dis*slope_2+max_height);
+    // }
 
-    double dis=sqrt(r2)-slp_second_RADIUS;
-    return z<=std::min(height_2,dis*slope_3+height_1);
+    // double dis=sqrt(r2)-slp_second_RADIUS;
+    // return z<=std::min(height_2,dis*slope_3+height_1);
     //add judgement for the indensity
+    return true;
 }
 
 //把一帧 CustomMsg 做安装角补偿后拆成两路：origin 收全部有效点，filtered 只收通过坡度滤波的点
@@ -89,9 +90,9 @@ void accumulate_scan(const livox_ros_driver2::CustomMsg &scan,
 {
     for (const auto &pt : scan.points)
     {
-        double x = pt.x - 0.011;
-        double y = pt.y + 0.02329;
-        double z = pt.z - 0.04412;
+        double x = pt.x ;
+        double y = pt.y ;
+        double z = pt.z ;
         double intensity = pt.reflectivity;
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
         {
@@ -105,7 +106,7 @@ void accumulate_scan(const livox_ros_driver2::CustomMsg &scan,
         origin.points.push_back(point);
 
         //注意这里传的是 -z，和存进点云的 z 不是一个值
-        if (ispoint(x, y, -z, intensity))
+        if (ispoint(x, y, z, intensity))
         {
             filtered.points.push_back(point);
         }
