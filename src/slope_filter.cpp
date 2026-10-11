@@ -14,13 +14,11 @@
 //Include for compute normals
 #include <pcl/features/normal_3d_omp.h>
 
-#include "livox_ros_driver2/msg/custom_msg.hpp"
+// #include "livox_ros_driver2/msg/custom_msg.hpp"
 
 //parameters given by the launch file
 std::string laser_frame;
-//单雷达：只订阅一个话题，是哪个雷达由 yaml 里的 scan_topic 决定
 std::string scan_topic;
-//双雷达版本（已停用，需要点云合并时才用）
 // std::string scan_topic_left;
 // std::string scan_topic_right;
 std::string new_scan_topic;
@@ -36,16 +34,25 @@ const int NORMAL_K_SEARCH = 20;//法向量估计的近邻数
 
 bool get_msg = false;
 
-livox_ros_driver2::msg::CustomMsg scan_copy;//receiving the message from the livox
+sensor_msgs::msg::PointCloud2 scan_copy;//receiving the message from the livox
 
 //callback function for the livox
-void scanCallback(const livox_ros_driver2::msg::CustomMsg &scan)
+void scanCallback(const sensor_msgs::msg::PointCloud2 &scan)
 {
     scan_copy = scan;
     get_msg = true;
 }
 
-//双雷达版本（已停用，需要点云合并时才用）
+//输入还是 livox CustomMsg 的版本（已停用，改成订阅 PointCloud2 了）
+// livox_ros_driver2::msg::CustomMsg scan_copy;
+//
+// void scanCallback(const livox_ros_driver2::msg::CustomMsg &scan)
+// {
+//     scan_copy = scan;
+//     get_msg = true;
+// }
+
+//电云合并
 // bool get_msg_left = false;
 // bool get_msg_right = false;
 //
@@ -64,7 +71,7 @@ void scanCallback(const livox_ros_driver2::msg::CustomMsg &scan)
 //     get_msg_right = true;
 // }
 
-//坡度滤波：当前只保留了"丢掉车体附近"这一条，分段高度上限那套已禁用
+//坡度滤波
 bool ispoint (double nx, double ny, double z, double nI)
 {
     (void)z;
@@ -84,34 +91,57 @@ bool ispoint (double nx, double ny, double z, double nI)
     return true;
 }
 
-//把一帧 CustomMsg 拆成两路：origin 收全部有效点，filtered 只收通过坡度滤波的点
-void accumulate_scan(const livox_ros_driver2::msg::CustomMsg &scan,
+//把一帧点云拆成两路：origin 收全部有效点，filtered 只收通过坡度滤波的点
+void accumulate_scan(const pcl::PointCloud<pcl::PointXYZI> &scan,
                      pcl::PointCloud<pcl::PointXYZI> &origin,
                      pcl::PointCloud<pcl::PointXYZI> &filtered)
 {
     for (const auto &pt : scan.points)
     {
-        double x = pt.x ;
-        double y = pt.y ;
-        double z = pt.z ;
-        double intensity = pt.reflectivity;
+        double x = pt.x;
+        double y = pt.y;
+        double z = pt.z;
+        double intensity = pt.intensity;
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
         {
             continue;
         }
-        pcl::PointXYZI point;
-        point.x = x;
-        point.y = y;
-        point.z = z;
-        point.intensity = intensity;
-        origin.points.push_back(point);
+        origin.points.push_back(pt);
 
         if (ispoint(x, y, z, intensity))
         {
-            filtered.points.push_back(point);
+            filtered.points.push_back(pt);
         }
     }
 }
+
+// void accumulate_scan(const livox_ros_driver2::msg::CustomMsg &scan,
+//                      pcl::PointCloud<pcl::PointXYZI> &origin,
+//                      pcl::PointCloud<pcl::PointXYZI> &filtered)
+// {
+//     for (const auto &pt : scan.points)
+//     {
+//         double x = pt.x ;
+//         double y = pt.y ;
+//         double z = pt.z ;
+//         double intensity = pt.reflectivity;
+//         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(intensity))
+//         {
+//             continue;
+//         }
+//         pcl::PointXYZI point;
+//         point.x = x;
+//         point.y = y;
+//         point.z = z;
+//         point.intensity = intensity;
+//         origin.points.push_back(point);
+//
+//         if (ispoint(x, y, z, intensity))
+//         {
+//             filtered.points.push_back(point);
+//         }
+//     }
+// }
 
 //体素下采样
 void down_sampling(const pcl::PointCloud<pcl::PointXYZI>::Ptr &input,
@@ -143,7 +173,7 @@ int main (int argc, char **argv)
 
     //参数：yaml / launch 里给了就用给的值，没给就用这里的默认值
     laser_frame      = node->declare_parameter<std::string>("laser_frame", "livox_frame");
-    scan_topic       = node->declare_parameter<std::string>("scan_topic",       "/livox/lidar_192_168_1_135");
+    scan_topic       = node->declare_parameter<std::string>("scan_topic",       "/livox/lidar_filtered");
     //双雷达版本（已停用）
     // scan_topic_left  = node->declare_parameter<std::string>("scan_topic_left",  "/livox/lidar_192_168_1_135");
     // scan_topic_right = node->declare_parameter<std::string>("scan_topic_right", "/livox/lidar_192_168_1_122");
@@ -161,9 +191,11 @@ int main (int argc, char **argv)
     RCLCPP_INFO(node->get_logger(), "first_radius=%.3f voxel_leaf=%.3f sor_mean_k=%d sor_stddev_mul=%.2f",
                 first_radius, voxel_leaf_size, sor_mean_k, sor_stddev_mul);
 
-    auto sub = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+    //输入改成 PointCloud2
+    auto sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
         scan_topic, 10, scanCallback);
-    //双雷达版本（已停用）
+    // auto sub = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+    //     scan_topic, 10, scanCallback);
     // auto sub_left  = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
     //     scan_topic_left,  10, scanCallback_left);
     // auto sub_right = node->create_subscription<livox_ros_driver2::msg::CustomMsg>(
@@ -175,7 +207,6 @@ int main (int argc, char **argv)
 
     while (rclcpp::ok())
     {
-        //单雷达：收一帧就处理，不用等第二路
         if (!get_msg)
         {
             rclcpp::spin_some(node);
@@ -185,14 +216,17 @@ int main (int argc, char **argv)
 
         auto scan_record = scan_copy;
 
+        //PointCloud2 -> PCL（需要消息里有 intensity 字段，livox 驱动的 PointCloud2 有）
+        pcl::PointCloud<pcl::PointXYZI> scan_cloud;
+        pcl::fromROSMsg(scan_record, scan_cloud);
+
         pcl::PointCloud<pcl::PointXYZI> origin_pcl_cloud;//给调试看的原始点云
         pcl::PointCloud<pcl::PointXYZI> pcl_cloud;//过了坡度滤波的点
-        origin_pcl_cloud.points.reserve(scan_record.points.size());
-        pcl_cloud.points.reserve(scan_record.points.size());
+        origin_pcl_cloud.points.reserve(scan_cloud.points.size());
+        pcl_cloud.points.reserve(scan_cloud.points.size());
 
-        accumulate_scan(scan_record, origin_pcl_cloud, pcl_cloud);
+        accumulate_scan(scan_cloud, origin_pcl_cloud, pcl_cloud);
 
-        //双雷达版本（已停用，点云合并：左右两帧叠成一帧）
         // if (!get_msg_left || !get_msg_right)
         // {
         //     rclcpp::spin_some(node);

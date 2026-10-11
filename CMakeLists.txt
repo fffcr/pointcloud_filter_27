@@ -16,7 +16,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
-find_package(livox_ros_driver2 REQUIRED)
+#输入改成 PointCloud2 后不再依赖 livox_ros_driver2，需要 CustomMsg 时再打开
+# find_package(livox_ros_driver2 REQUIRED)
 
 # 法向量估计走 OMP 并行，一定要开 OpenMP，否则 NormalEstimationOMP 会退化甚至编不过
 find_package(OpenMP REQUIRED)
@@ -36,7 +37,7 @@ ament_target_dependencies(${PROJECT_NAME}_node
   rclcpp
   sensor_msgs
   pcl_conversions
-  livox_ros_driver2
+  # livox_ros_driver2
 )
 
 target_link_libraries(${PROJECT_NAME}_node

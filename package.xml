@@ -12,7 +12,8 @@
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>pcl_conversions</depend>
-  <depend>livox_ros_driver2</depend>
+  <!-- 输入改成 PointCloud2 后不再依赖 livox_ros_driver2，需要 CustomMsg 时再打开 -->
+  <!-- <depend>livox_ros_driver2</depend> -->
 
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
