@@ -18,6 +18,8 @@ def generate_launch_description():
             # 必须和 yaml 顶层的 key、以及 cpp 里的 node_name 一致
             name='threeD_lidar_filter_pointcloud',
             output='screen',
-            parameters=[config_file]
+            # 仿真里必须跟 sim time，否则 stamp 用墙上时间，RViz(use_sim_time:=true) 不渲染
+            # 上真车时删掉这一项
+            parameters=[config_file, {'use_sim_time': True}]
         )
     ])

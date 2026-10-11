@@ -12,6 +12,20 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# macOS（RoboStack / pixi）：环境里不设 DYLD_LIBRARY_PATH，运行时动态库解析
+# 完全依赖二进制自身的 rpath。RoboStack 预编译的包带 @loader_path/.. ，但 colcon
+# 编出来的目标默认不写任何 rpath，于是启动时报：
+#   dyld: Library not loaded: @rpath/libmessage_filters.dylib
+#   (librclcpp.dylib 等同理，它们都在 $CONDA_PREFIX/lib 下)
+# 这里显式把 conda 环境的 lib 目录写进 rpath。
+if(APPLE)
+  if(DEFINED ENV{CONDA_PREFIX})
+    set(CMAKE_INSTALL_RPATH "$ENV{CONDA_PREFIX}/lib")
+  endif()
+  # 兜底：把链接期用到的库目录也加进来
+  set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -44,6 +58,20 @@ target_link_libraries(${PROJECT_NAME}_node
   ${PCL_LIBRARIES}
   OpenMP::OpenMP_CXX
 )
+
+if(APPLE)
+  # ROS 的消息包会把 Python 绑定库（*__rosidl_generator_py.dylib，由 rclcpp 等
+  # 经 interface target 传递进来）一起带上链接行。这些是用
+  # `-undefined dynamic_lookup` 编的 Python 扩展模块，符号本该由 Python 宿主
+  # 进程提供；链进纯 C++ 节点后 dyld 解析不到 _PyExc_RuntimeError 会直接崩：
+  #   dyld: symbol not found in flat namespace '_PyExc_RuntimeError'
+  #
+  # 注意：只在 CMake 层过滤 LINK_LIBRARIES 是没用的——大部分 py 绑定是经由
+  # interface target 的 INTERFACE_LINK_LIBRARIES 展开进来的，过滤不掉。
+  # 交给链接器：-dead_strip_dylibs 会丢掉输出里没有任何符号被引用的 dylib，
+  # 正好把用不到的 Python 绑定清干净，其余依赖不受影响。
+  target_link_options(${PROJECT_NAME}_node PRIVATE "-Wl,-dead_strip_dylibs")
+endif()
 
 install(TARGETS ${PROJECT_NAME}_node
   DESTINATION lib/${PROJECT_NAME}
