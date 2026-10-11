@@ -4,8 +4,9 @@ threeD_lidar_filter_pointcloud:
     
     laser_frame: livox_frame
 
-    scan_topic_left: /livox/lidar_192_168_1_135
-    scan_topic_right: /livox/lidar_192_168_1_122
+    scan_topic: /livox/lidar_filtered   # 单雷达：只订阅这一个话题
+    # scan_topic_left: /livox/lidar_192_168_1_135
+    # scan_topic_right: /livox/lidar_192_168_1_122
     new_scan_topic: /cloud_origin       # 未滤波原始点云，调试看
     
     filted_topic_3d: /cloud_slope_filtered # 滤波结果
